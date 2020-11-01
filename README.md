@@ -615,3 +615,176 @@ but as soon as your hosts are configured to reach traefik service correctly with
 
 Just a tip don't bother with https if you don't have to have certificates, or if your cluster is never opened on the internet, you can run everything on http and have your own urls as well, just remember there won't be encryptions between you and your app if that's what you decide to do.
   
+## Let's add NFS storage to our pods !
+
+OK so in this update we will add volumes to our pods so that we can keep data on disk if we restart our pods.
+If yu followed along this tutorial of some sort you have now a traefik instance that automatically gets you a certificate once a new route is created.
+This is super convenient but once you remove the "staging" let's encrypt server you will see that you might reach a certificate limit, aka you asked too many times for the same certificate.
+
+That happens because as you turn off your traefik instance (for whatever reason) and run it again it will ask again and again for the certificate for the various routes you created.
+
+Reaching your limit very quickly.
+
+In order to avoid that we will create three things (and again we will do so without any automation so we really understand what is happening):
+
+- A volume
+- A volume claim
+- A traefik deployment with updated parameters
+
+Ok so let's go do that ! BUT before that, I am not entering here into the NFS territory I suppose you already have an NFS server with users that have the right to use a specific volume of your NFS server.
+Considering the following for the rest of this tutorial:
+
+- You have an NFS server with a folder in it that you have access to
+- You have a user ID and GID at hand and this user has permissions to use the NFS share
+
+In my case I created a volume on my nas and gave a user "kube" the right to access this folder, this kube user has an ID of 1040 and a GID of 200, but of course yours may vary, and thos values are random invented for this tutorial.
+I also made my NFS share accept direct connections from my kubernetes IPs and local machine IPs so I can access the NFS share directly without being bothered by access codes.
+This vary per NAS distribution so I can't really help you setting this up, but a quick search with "NFS on my XXX nas" should help you.
+
+OK so now we can tackle the kube side of things.
+
+First thing first we will create a volume, this object is the one mapping your NFS share and making it accessible on kubernetes.
+In my example below I created a volume called traefik-data-pv and gave it a capacity of 5gigs. I also made sure I have a "readWriteOnce" option which means only one claim can be made on that volume
+(more on that later). I also flyover storage class here and use the default, you may want to read more on that but let say here that I don't have different kinds of storage
+usually you would use that create a class based on SSD and HDD for instance so that some volumes are automatically stored on SSD, this kind of things. Imagine that as premium storage, basic storage, medium storage and so on. 
+Not so relevant for me though.
+The interesting part is the "nfs" options where you specify a directory in my NFS volume and the IP of my NFS server. 
+```yaml
+## PV traefik data
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: traefik-data-pv
+spec:
+  capacity:
+    storage: 5Gi
+  storageClassName: "local-path"
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  mountOptions:
+      - hard
+  nfs:
+    path: "/vl3/Kubernetes/traefik" # insert here your NFS path where traefik will save data
+    server: "XX.XX.XX.XX" # insert here your NFS server IP
+
+```
+
+Now that is done we can create a "claim" an object that will basically use the volume, this claim makes some kind of a bridge between the volume and a kubernetes pod.
+Think of it as inserting an usb drive to the pod itself in some way. Note that the claim must match the volume created you can't have a claim that ask for bigger storage then a volume.
+You can however have a claim that ask for less storage but remember a volume can only support one claim so better use all the storage.
+
+Here is my claim (also note that it references the previous volume):
+
+```yaml
+## PVC traefik data
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traefik-data-pvc
+spec:
+  volumeName: traefik-data-pv
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: "local-path"
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+```
+
+Now as usual we can save thos definition in a file like "volume.yml" and apply that with a good old:
+```
+kubectl apply -f volume.yml
+```
+
+Now the important thing is if you now do:
+```
+kubectl get pvc
+```
+You should see your claim with a status "Bound" this means the claim found the volume and the volume is ok !
+AKA you are on the good direction.
+
+Now for the final step we want to make sure our traefik is saving the certificates on that volume. Here is an updated version of the traefik deployment file that does just that:
+(I removed the previous explanation comments written previously so we can focus on the volume part of things feel free to scroll up for more info on labels)
+```yaml
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  namespace: default
+  name: traefik
+  labels:
+    app: traefik
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traefik
+  template:
+    metadata:
+      labels:
+        app: traefik
+    spec:
+
+      # now this security context will vary according to how you have setup things on your nfs share.
+      # if you created a share and said "this IP is allowed to do everything" then you don't need the security context
+      # if on the other hand you said "no only this user is allowed to do something" then you must tell your pod to act as this user
+      # otherwise you will run into security issues such as "no permission allowed" when you will try to save data on the NFS share
+      # in my case I have a double safety I say this IP and this account only can use my share so I must specifiy here the account "kube" I created earlier on my nas
+      securityContext:
+        runAsUser: 1040 # my kube user ID
+        runAsGroup: 200 # my kube group ID
+      
+      serviceAccountName: traefik-ingress-controller
+      containers:
+        - name: traefik
+          image: traefik:v2.3
+          args:
+            - --accesslog
+            - --entrypoints.web.Address=:80
+            - --entrypoints.web.http.redirections.entryPoint.to=web-secure
+            - --entrypoints.web.http.redirections.entryPoint.scheme=https
+            - --entrypoints.web.http.redirections.entrypoint.permanent=true
+            - --entrypoints.web-secure.Address=:443
+            - --providers.kubernetescrd
+            - --certificatesresolvers.certresolver.acme.tlschallenge
+            - --certificatesresolvers.certresolver.acme.email=you@email.com
+            # Here if I would have left acme.json Kubernetes would have seen this as a folder even if I have a sub path onmy volume mount so I decided to 
+            # put the acme.json file in a folder called certs at the root of this container and it works just fine
+            - --certificatesresolvers.certresolver.acme.storage=/certs/acme.json 
+
+            # Careful here I removed the staging server and put the real one cause I already know this is working for me 
+            # make sure you have staging first so you can test things
+            - --certificatesresolvers.certresolver.acme.caserver=https://acme-v02.api.letsencrypt.org/directory
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+          # Here is the interesting part I am here defining a mounting point so that in my cluster the path /certs is actually mounted on the nfs-data volume
+          # which I add to my deployment later on
+          volumeMounts:
+            - name: nfs-data
+              mountPath: /certs
+      # Here is the volume nfs-data and as you can see I reference here my volume claim that I created earlier.
+      # nothing really fancy must be done once you understand it is quite straight forward
+      volumes:
+        - name: nfs-data
+          persistentVolumeClaim:
+            claimName: traefik-data-pvc # the name of the claim you created earlier
+```
+
+OK so at this point once you "kubectl apply -f" this new traefik deployment you should see it starting up and if your permissions and account are setup correctly you will see your acme.json pop in your NFS folder.
+
+If this is not the case check the logs of traefik as they are rather explicit:
+```shell script
+kubectl logs -f <traefik pod> 
+```
+
+OK so now not only your have a multi node kubernetes cluster but also a reverse proxy with ssl certificates AND nfs storage !
+You are pretty much rock solid to start whatever apps you might want !
+
