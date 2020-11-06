@@ -785,6 +785,289 @@ If this is not the case check the logs of traefik as they are rather explicit:
 kubectl logs -f <traefik pod> 
 ```
 
-OK so now not only your have a multi node kubernetes cluster but also a reverse proxy with ssl certificates AND nfs storage !
+OK so now not only your have a multi node kubernetes cluster but also a reverse proxy with ssl certificates AND NFS storage !
 You are pretty much rock solid to start whatever apps you might want !
+
+## The last piece to the puzzle an SSO
+
+In this section the goal is to setup an SSO (single sign on) with two factor authentication for every services that you want to protect.
+This has some advantages, for instance if you want to deploy an app like for instance Homer (a dashboard to present different links) that doesn't come with 
+a built in authentication mechanism you don't have to worry about it, cause something else is handling the authentication for you.
+
+Doing so you have a software running to let other services know you are authenticated or not and you can happily disable if you want the login screen of your other services because this is not required now.
+
+The flow that we want to put in place is the following:
+ - You want to access home.domain.com (let say a homer instance)
+ - You are first redirected to https via what we put in place earlier.
+ - Once in https you are then redirected to an authentication server.
+ - This server is checking if you are logged in, if you are you don't even see anything and you reach directly your initial address
+ - If you are not however you are asked to login 
+ - After a successful login you are redirected to the initial address
+
+This however has some pre-requisites that are important:
+ - You don't necessarily need a domain, however if you don't you need to change your host files so that example.domain.com and whatever.domain.com are redirect to different apps, in this tutorial we will setup an authentication server on auth.domain.com and a test app on app.domain.com, so make sure you have that ready !
+
+What tools we will use for the job... There is many tools that are able to do this job ! I went through a lot and I figured that the easiest for us in a homelab environment is called Authelia.
+
+Authelia is excatly what we need for the job, it's fast, secure and even though it is not as huge as a keycloak server for instance, it also means that it's way faster to run it and easier to understand, which for a homelab is perfect ;)
+
+So as usual with every app that we want to run with kube we have to add a couple of things here, services, deployments etc you know the drill you just have to kubectl apply the different files, so here we go.
+
+We start first with a namespace, we will use that to keep everything related to authentication inside its own space:
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name:  authentication
+```
+
+Then we need a service so we can reach our application:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: authentication
+  name: authelia-service # give it the name that you want
+spec:
+  ports:
+    - name: http
+      port: 9091 # our service exposes here the port 9091 (it's redundant to specify both but for sake of understanding here I do it all)
+      protocol: TCP
+      targetPort: 9091 # our service targets the port 9091 from the container running in the back
+  selector:
+    app: authelia # we want to access authelia
+```
+
+Once we got that, we need volumes and the associated volume claims in order to keep data on our NFS server that we managed to use on the previous steps of this tutorial, we have two volumes and two volume claims, in this example I will save the config and the secret in two different places but you can choose otherwise if you want to:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  namespace: authentication
+  name: authelia-config-pv # you can specify another name if you want
+spec:
+  capacity:
+    storage: 10Gi # 10 gigs may be too much you might decide to give it less
+  storageClassName: "local-path"
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce # specify here that only one claim will be able to use this volume
+  mountOptions:
+      - hard
+  nfs:
+    path: "your/path/to/volume/authelia/" # replace here with the destination folder where authelia will store data (inside your NFS server)
+    server: "XX.XX.XX.XX" # replace here with your server IP
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: authentication
+  name: authelia-config-pvc
+spec:
+  volumeName: authelia-config-pv # here as usual we reference the volume we created previously
+  resources:
+    requests:
+      storage: 10Gi # and we make sure that they both have the same size
+  storageClassName: "local-path"
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce 
+
+---
+
+# the volume and claim below are used to store the "secret" files in order to setup authelia without revealing secret informations
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  namespace: authentication
+  name: authelia-secret-pv # you can always change those names
+spec:
+  capacity:
+    storage: 10Gi
+  storageClassName: "local-path"
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  mountOptions:
+      - hard
+  nfs:
+    path: "/path/to/your/secret/location"
+    server: "XX.XX.XX.XX" # your NFS server IP
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: authentication
+  name: authelia-secret-pvc
+spec:
+  volumeName: authelia-secret-pv
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: "local-path"
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+```
+
+Now that this is done we just need a couple more things, like the deployment:
+```yaml
+kind: Deployment
+apiVersion: apps/v1
+
+metadata:
+  namespace: authentication
+  name: authelia
+  labels:
+    app: authelia
+
+spec:
+  replicas: 1
+  selector:
+      matchLabels:
+        app: authelia  
+  template:
+    metadata:
+      labels:
+        app: authelia
+    spec:
+      securityContext:
+        runAsUser: 1040 # this as seen previously is the NFS kube id we saw in previous sections (yours will vary of course)
+        runAsGroup: 200 # this is kube group id also seen previously
+      containers:
+        - name: authelia
+          image: authelia/authelia # here we just take the latest version
+          env:
+            - name: AUTHELIA_JWT_SECRET_FILE
+              value: /app/secrets/NFS-JWT-FILE # here we specify were is the jwt token required by authelia, the part after secret is present in your NFS server, this means you must have a file under your secret location defined above in the volume which is named NFS-JWT-FILE (of course you can change the name) this file must only contain the following: jwt_secret=your-super-secret-key-that-you-must-define-by-yourself
+            
+            - name: AUTHELIA_SESSION_SECRET_FILE 
+              value: /app/secrets/SESSION-FILE # same as above but for the session this file must contain: secret=your-super-secret-blablabla-you-got-it
+            
+          ports:
+            - containerPort: 9091 # we open here port 9091 
+              name: http
+          volumeMounts:
+            - name: nfs-data
+              mountPath: /config # we map the volume required for the config file
+            - name: nfs-secret
+              mountPath: /app/secrets # we map here the volume required for the secrets
+              
+      volumes:
+        - name: nfs-data
+          persistentVolumeClaim:
+            claimName: authelia-config-pvc # claimes defined previously
+        - name: nfs-secret
+          persistentVolumeClaim:
+            claimName: authelia-secret-pvc
+```
+
+Now don't apply it just yet.
+
+Now we have to create a configuration file for authelia that we must store at the root of our config volume and name it configuration.yml
+
+There is an example of a configuration file here: https://github.com/authelia/authelia/blob/master/compose/local/authelia/configuration.yml
+I also invite you to read this: https://www.authelia.com/docs/configuration/ it describe every options available to configure authelia according to your needs.
+
+As for myself for instance I decided to use a postgres database to store data and a redis database to store sessions, as everything can be different according to each person I will let you decide what is best for you and your cluster.
+
+Once you have this figured out you can apply the deployment and see if it boots up correctly (again via kubectl get deployment -A)
+
+The next step is to create a traefik route so we can access our authentication server via something like auth.domain.com
+Here is how you do it:
+```yaml 
+kind: IngressRoute
+apiVersion: traefik.containo.us/v1alpha1
+metadata:
+  name: authelia-route-secure
+  namespace: authentication
+spec:
+  entryPoints:
+    - https
+  routes:
+  - match: Host(`auth.domain.com`) # of course change it according to your domain
+    kind: Rule
+    services:
+    - name: authelia-service # we want to reach authelia service
+      port: 9091 # on port 9091
+  tls:
+    certResolver: certresolver # we want automatic SSL as describe in past sections
+```
+
+Ok so by now we have almost every pieces of the puzzle, we just need to let traefik know what to do. This is called forward auth.
+
+Forward auth works in a very simple way, in this example as we want to secure specific services we will create first a middleware and apply it on different traefik routes, or you can decide to apply it directly to every route by applying this middleware to the https endpoint. You decide. Let me show you how to specifically secure one endpoint.
+
+First as we said we need the middleware:
+```yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: authelia # here I am leaving it in the default namespace but you can change it if you want to
+spec:
+  forwardAuth:
+    # the address is a bit tricky, first we want our forward auth to redirect to the service we created earlier which was named authelia-service
+    # but this service is in another namespace
+    # in kubernetes to reference a service in another namespace you must an internal DNS name which is written like so:
+    # service-name.namespace.svc.cluster.local
+    # this is why you see this complicated url under address
+    # also we target the port 9091 and the path required by authelia /api/verify?rd=TheURLWhereAutheliaIsRunning
+    # took me a long time to understand this but yeah you need all that
+    address: http://authelia-service.authentication.svc.cluster.local:9091/api/verify?rd=https://auth.domain.com/
+    trustForwardHeader: true
+    # authelia requires those options to work properly basically you pass on arguments from your users when they login back to your apps
+    # you can add more stuff if you like but check the authelia documentation for more info
+    authResponseHeaders:
+      - Remote-User
+      - Remote-Groups
+      - Remote-Name
+      - Remote-Email
+```
+
+OK so by now we have all but one piece of the puzzle here ! 
+
+We just need to secure a traqefik route so that we pass by this middleware, here I am taking a random route that redirects to a homer dashboard, of course you must have the dashboard actually running and reachable for this to work
+
+Here is an example of the new route:
+```yaml
+kind: IngressRoute
+apiVersion: traefik.containo.us/v1alpha1
+metadata:
+  name: homer-route-secure
+  namespace: dashboard
+spec:
+  entryPoints:
+    - https
+  routes:
+  - match: Host(`home.domain.com`)
+    kind: Rule
+    services:
+    - name: homer-service # we redirect to a hypothetique homer service
+      port: 8080 # on port 8080
+    middlewares: # here is the important part we add to this route the middleware we just created above the name is
+                 # namespace-nameOfTheMiddleware@kubernetescrd the kubernetescrd is because we have setup traefik with this argument --providers
+                 # kubernetescrd
+      - name: default-authelia@kubernetescrd # the middleware authelia in the default namespace
+  tls:
+    certResolver: certresolver
+```
+
+Finally now we have if you've done everything correctly you can access homer and see the authelia login screen ! You can login and then be redirected to your homer dashboard !
+
+## Conclusions
+
+This documentation is a draft as of today, I didn't put any picture yet didn't correct the language etc this is a work in progress and maybe will be improved further eventually maybe hopefully.........
+
+However I had a goal not so long ago when I had no idea about containers and docker and kubernetes and my goal was to help you guys not to struggle like me and spend months and months (thanks covid for the free time :/) to figure out everything by yourself... I hope it helps you and if you have any problems you can reach me here via an issue or on my reddit https://www.reddit.com/user/SirSirae feel free to message me.
+
+Summing it up we now have a multi node kube cluster, a reverse proxy with automatic ssl and https redirection, an SSO to secure every services we want to serve on our cluster ! Now you can pretty much do whatever you want on your cluster and host whatever apps you want they will all be secured ! 
+
+Achievement unlocked: understand kubernetes before the end of 2020 !!!!! 
+
 
