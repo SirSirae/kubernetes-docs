@@ -399,7 +399,7 @@ spec:
           args:
             # This should not be setup when you are in production as it creates a dashboard that can be accessed by anyone
             # but for our test needs it is great just remember to remove it 
-            - --insecure.api
+            - --api.insecure
             - --accesslog
 
             # Here we define our entry points we have two of them one at 80 (we call it web) and one at 443 (we call it websecure)
